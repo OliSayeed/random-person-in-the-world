@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Population-Weighted Place + Age/Sex (CSV-first, XLSX-fallback)</title>
+<title>Population-Weighted Place + Age/Sex (v3.5 — CSV-first, 2-part city support)</title>
 
 <!-- Leaflet -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous"/>
@@ -12,7 +12,7 @@
 <!-- Papa Parse (city CSV + small WPP CSV) -->
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" crossorigin="anonymous"></script>
 
-<!-- SheetJS (ONLY used if the CSV isn’t present; parses the big UN XLSX files in-browser) -->
+<!-- SheetJS (ONLY used if the WPP CSV isn’t present; parses big UN XLSX files in-browser) -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" crossorigin="anonymous"></script>
 
 <style>
@@ -54,11 +54,11 @@
 <body>
 
 <div class="topbar">
-  <div class="brand">Population-Weighted Place + Age/Sex</div>
+  <div class="brand">Population-Weighted Place + Age/Sex (v3.5)</div>
   <div class="controls">
     <label class="file">
-      <span>Choose city CSV:</span>
-      <input id="fileInput" type="file" accept=".csv,text/csv">
+      <span>Choose city CSV(s):</span>
+      <input id="fileInput" type="file" accept=".csv,text/csv" multiple>
     </label>
     <label>Sex mode:
       <select id="sexMode">
@@ -66,12 +66,12 @@
         <option value="real">Use country sex ratio</option>
       </select>
     </label>
-    <span class="muted">Tries <code>/data/wpp_age_single_year_2024.csv</code>; falls back to UN XLSX in <code>/data</code></span>
+    <span class="muted">Auto-loads /data/wpp_age_single_year_2024.csv; falls back to UN XLSX in /data.</span>
   </div>
 </div>
 
 <div id="map"></div>
-<div id="dropzone">Drop your <b style="margin-left:6px;">geonames_10k.csv</b> here</div>
+<div id="dropzone">Drop your <b style="margin-left:6px;">city CSV(s)</b> here</div>
 
 <div id="infoPanel" class="panel">
   <h1 id="placeTitle">—</h1>
@@ -88,9 +88,12 @@
 <script>
 /* ===== Config ===== */
 const WPP_YEAR = 2024;
-const WPP_CSV_PATH = 'data/wpp_age_single_year_2024.csv'; // tiny file you’ll upload
+const WPP_CSV_PATH = 'data/wpp_age_single_year_2024.csv';
 const WPP_MALE_XLSX = ['data/WPP2024_POP_F01_2_POPULATION_SINGLE_AGE_MALE.xlsx'];
 const WPP_FEMALE_XLSX = ['data/WPP2024_POP_F01_3_POPULATION_SINGLE_AGE_FEMALE.xlsx'];
+
+const CITY_PARTS = ['data/geonames_part1.csv','data/geonames_part2.csv'];
+const CITY_SINGLE = 'data/geonames_10k.csv';
 
 /* ===== Map (same v3.2 dynamics) ===== */
 let map=null, labelsOverlay=null, currentMarker=null;
@@ -120,8 +123,7 @@ function looksLikeHTML(text){ return /^\s*<!doctype html>|^\s*<html/i.test(text)
 function normName(s){ return (s||'').toString().normalize('NFD').replace(/\p{Diacritic}/gu,'').trim().toLowerCase(); }
 function ageToInt(s){ const m=String(s).match(/\d+/); return m ? Math.min(100, parseInt(m[0],10)) : 100; } // 100+ -> 100
 
-/* ===== City CSV parsing ===== */
-let cachedCities=null;
+/* ===== City CSV parsing & merging ===== */
 function parseRows(rows){
   const out=[];
   for(const r of rows){
@@ -146,30 +148,25 @@ function parseRows(rows){
   }
   return out;
 }
-function parseCSVFile(file){
+function papaFetch(url){
   return new Promise((resolve,reject)=>{
-    Papa.parse(file,{
-      header:true, skipEmptyLines:true, transformHeader: normalizeHeader,
-      complete: function(res){
-        try{
-          const fields=res.meta?.fields||[];
-          if(!fields.length){
-            const reader=new FileReader();
-            reader.onload=()=>{
-              const t=reader.result;
-              if(looksLikeHTML(t)) reject(new Error('Got HTML instead of CSV.'));
-              else reject(new Error('No header row detected.'));
-            };
-            reader.readAsText(file); return;
-          }
-          const cities=parseRows(res.data);
-          if(!cities.length) return reject(new Error('No valid rows with name/lat/lon were found.'));
-          resolve(cities);
-        }catch(err){ reject(err); }
-      },
-      error: err=>reject(err)
-    });
+    Papa.parse(url,{download:true,header:true,skipEmptyLines:true,transformHeader:normalizeHeader,
+      complete: res=>resolve(res.data), error: err=>reject(err)});
   });
+}
+async function loadCityData(){
+  try{
+    const [p1,p2] = await Promise.all([papaFetch(CITY_PARTS[0]), papaFetch(CITY_PARTS[1])]);
+    const rows = [...p1,...p2];
+    const parsed = parseRows(rows);
+    if(parsed.length) return parsed;
+  }catch(_){}
+  try{
+    const single = await papaFetch(CITY_SINGLE);
+    const parsed = parseRows(single);
+    if(parsed.length) return parsed;
+  }catch(_){}
+  return null; // fall back to user upload
 }
 
 /* ===== WPP loading: CSV-first; if missing, fall back to XLSX ===== */
@@ -264,12 +261,8 @@ async function loadWppXLSX(){
   return 'xlsx';
 }
 async function loadWPP(){
-  try{
-    return await loadWppCSV();
-  }catch(_){
-    try{ return await loadWppXLSX(); }
-    catch(e){ console.warn('WPP load failed:', e); return 'none'; }
-  }
+  try{ return await loadWppCSV(); }
+  catch(_){ try{ return await loadWppXLSX(); } catch(e){ console.warn('WPP load failed:', e); return 'none'; } }
 }
 
 /* ===== Sampling ===== */
@@ -283,7 +276,7 @@ function pickWeighted(items, weightFn){
 }
 function sampleSex(countryName, mode){
   if(mode==='50') return Math.random()<0.5 ? 'Male' : 'Female';
-  const rows = wppByCountry.get(normName(countryName||'')); // country ratio
+  const rows = wppByCountry.get(normName(countryName||''));
   if(!rows || !rows.length){
     const t=wppTotals.male + wppTotals.female;
     if(t<=0) return Math.random()<0.5 ? 'Male' : 'Female';
@@ -302,7 +295,7 @@ function sampleAge(countryName, sex){
   return picked ? picked.age : null;
 }
 
-/* ===== Show chosen place (same fly as v3.2) ===== */
+/* ===== Show chosen place (v3.2 fly) ===== */
 function showPlace(c){
   if(currentMarker){ map.removeLayer(currentMarker); currentMarker=null; }
   const label=[c.name, c.sub||null, c.country||null].filter(Boolean).join(' — ');
@@ -342,23 +335,30 @@ function pickWeightedByPopulation(cities){
   }
 }
 
-/* ===== Handlers ===== */
-function handleFiles(files){
-  const f=files && files[0]; if(!f) return;
-  showToast('Parsing city file…');
-  Papa.parse(f,{
-    header:true, skipEmptyLines:true, transformHeader: normalizeHeader,
-    complete: res=>{
-      try{
-        const cities=parseRows(res.data);
-        if(!cities.length) return alert('No valid rows with name/lat/lon were found.');
-        const chosen=pickWeightedByPopulation(cities);
-        cachedCities=cities;
-        showPlace(chosen);
-      }catch(e){ alert(e.message||String(e)); }
-    },
-    error: err=>alert(err.message||String(err))
+/* ===== Upload/drag handlers (accept 1 or 2 files) ===== */
+function parseCSVFiles(fileList){
+  return new Promise((resolve,reject)=>{
+    const files = Array.from(fileList||[]);
+    if(!files.length) return reject(new Error('No files'));
+    const results=[];
+    let done=0;
+    files.forEach(f=>{
+      Papa.parse(f,{header:true,skipEmptyLines:true,transformHeader:normalizeHeader,
+        complete: res=>{ results.push(res.data); if(++done===files.length) resolve([].concat(...results)); },
+        error: _=>{ if(++done===files.length) resolve([].concat(...results)); }
+      });
+    });
   });
+}
+function handleFiles(files){
+  if(!files || !files.length) return;
+  showToast('Parsing city file(s)…');
+  parseCSVFiles(files).then(rows=>{
+    const cities=parseRows(rows);
+    if(!cities.length) return alert('No valid rows with name/lat/lon were found.');
+    const chosen=pickWeightedByPopulation(cities);
+    showPlace(chosen);
+  }).catch(err=>alert(err.message||String(err)));
 }
 fileInput.addEventListener('change',(e)=>handleFiles(e.target.files));
 ['dragenter','dragover'].forEach(ev=>{
@@ -369,10 +369,24 @@ fileInput.addEventListener('change',(e)=>handleFiles(e.target.files));
 });
 window.addEventListener('drop',(e)=>handleFiles(e.dataTransfer && e.dataTransfer.files));
 
-/* ===== Boot: load WPP (CSV-first, then XLSX) ===== */
+/* ===== Boot ===== */
 window.addEventListener('DOMContentLoaded', async ()=>{
-  const source = await loadWPP();
-  console.log('WPP source:', source);
+  // Load WPP distributions (CSV first, then XLSX)
+  const wppSource = await loadWPP();
+  console.log('WPP source:', wppSource);
+
+  // Try to auto-load city CSV(s) from /data; if present, immediately pick a place
+  try{
+    const auto = await loadCityData();
+    if(auto && auto.length){
+      const chosen=pickWeightedByPopulation(auto);
+      showPlace(chosen);
+    }else{
+      showToast('Upload one or two city CSV files to start');
+    }
+  }catch(_){
+    showToast('Upload one or two city CSV files to start');
+  }
 });
 </script>
 </body>
