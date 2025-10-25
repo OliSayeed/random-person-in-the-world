@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Population-Weighted Place + Age/Sex (root CSVs, IDB API)</title>
+<title>Population-Weighted Place + Empirical Age/Sex (smart local/remote)</title>
 
 <!-- Leaflet -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="anonymous"></script>
 
-<!-- Papa Parse (city CSVs) -->
+<!-- Papa Parse -->
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" crossorigin="anonymous"></script>
 
 <style>
@@ -29,15 +29,27 @@
   .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#111827;border:1px solid #263044;border-radius:10px;
          padding:10px 14px;font-weight:600;letter-spacing:.2px;display:none;}
   .toast.show{display:block;}
+  /* Hidden file input (auto-shown only if remote fetch fails) */
+  #fileWrap{position:fixed;inset:56px 0 0 0;display:none;align-items:center;justify-content:center;}
+  #fileWrap.open{display:flex;}
+  label.file{display:inline-flex;align-items:center;gap:8px;background:#1a2233;border:1px solid #2a3347;border-radius:10px;padding:12px 14px;cursor:pointer;color:#e9eef6;font-weight:700;}
+  input[type="file"]{display:none;}
 </style>
 </head>
 <body>
 
 <div class="topbar">
-  <div class="brand">Population-Weighted Place + Age/Sex</div>
+  <div class="brand">Population-Weighted Place + Empirical Age/Sex</div>
 </div>
 
 <div id="map"></div>
+
+<div id="fileWrap">
+  <label class="file">
+    <span>Choose your city CSV (or the two parts)</span>
+    <input id="fileInput" type="file" accept=".csv,text/csv" multiple>
+  </label>
+</div>
 
 <div id="infoPanel" class="panel">
   <h1 id="placeTitle">—</h1>
@@ -53,11 +65,10 @@
 
 <script>
 /* ========= Config ========= */
-const YEAR = 2024; // change to 2025 later if you like
-// All files expected at repo root (same folder as index.html)
-const CITY_PARTS = ['geonames_part1.csv','geonames_part2.csv'];
+const YEAR = 2024;
+const CITY_PARTS = ['geonames_part1.csv','geonames_part2.csv']; // same folder as index.html
 const CITY_SINGLE = 'geonames_10k.csv';
-const IDB_BASE = 'https://api.census.gov/data/timeseries/idb/1year'; // U.S. Census IDB
+const IDB_BASE = 'https://api.census.gov/data/timeseries/idb/1year';
 
 /* ========= Map (v3.2 dynamics) ========= */
 let map=null, labelsOverlay=null, currentMarker=null;
@@ -68,7 +79,7 @@ let map=null, labelsOverlay=null, currentMarker=null;
   map.setMaxBounds([[-85,-200],[85,200]]);
 })();
 
-/* ========= UI helpers ========= */
+/* ========= UI ========= */
 const panel      = document.getElementById('infoPanel');
 const placeTitle = document.getElementById('placeTitle');
 const placeSubEl = document.getElementById('placeSub');
@@ -76,61 +87,116 @@ const placePopEl = document.getElementById('placePop');
 const sexLbl     = document.getElementById('sexLbl');
 const ageLbl     = document.getElementById('ageLbl');
 const toast      = document.getElementById('toast');
+const fileWrap   = document.getElementById('fileWrap');
+const fileInput  = document.getElementById('fileInput');
 
 function showToast(msg){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'), 1400); }
 function fmt(n){ try{return Number(n).toLocaleString();}catch{ return String(n); } }
 function normalizeHeader(h){ return (h||'').toString().replace(/^\uFEFF/,'').trim(); }
 function normName(s){ return (s||'').toString().normalize('NFD').replace(/\p{Diacritic}/gu,'').trim().toLowerCase(); }
 
-/* ========= City CSV parsing ========= */
-function parseRows(rows){
-  const out=[];
-  for(const r of rows){
-    const keys=Object.keys(r); if(!keys.length) continue;
-    const lower={}; for(const k of keys){ lower[normalizeHeader(k).toLowerCase()]=k; }
-    const name=(r[lower['name']] ?? r[lower['ascii name']] ?? r[lower['city']] ?? r[lower['placename']] ?? '').toString().trim();
-    if(!name) continue;
-    let latRaw=r[lower['lat']] ?? r[lower['latitude']] ?? r[lower['lat (deg)']] ?? r[lower['y']];
-    let lonRaw=r[lower['lon']] ?? r[lower['long']] ?? r[lower['lng']] ?? r[lower['longitude']] ?? r[lower['x']];
-    if((latRaw==null || lonRaw==null) && (r['Coordinates']!=null || r['Coordinates ']!=null)){
-      const parts=(r['Coordinates'] ?? r['Coordinates ']).toString().split(',',2); if(parts.length===2){ latRaw=parts[0].trim(); lonRaw=parts[1].trim(); }
-    }
-    const lat=parseFloat(String(latRaw).replace(',','.'));
-    const lon=parseFloat(String(lonRaw).replace(',','.'));
-    if(!isFinite(lat)||!isFinite(lon)) continue;
-    if(lat<-90||lat>90||lon<-180||lon>180) continue;
-    const popRaw=r['Population'] ?? r['population'] ?? r['pop'] ?? r['Population '] ?? r['POP'] ?? null;
-    const pop=Number.isFinite(parseInt(popRaw,10)) ? parseInt(popRaw,10) : null;
-    const country=(r['Country name EN'] ?? r['Country'] ?? r['Country Name'] ?? r['country'] ?? '').toString().trim() || null;
-    const sub=(r['Admin1'] ?? r['Admin1 Name'] ?? r['Sub'] ?? r['Subdivision'] ?? '').toString().trim() || null;
-    out.push({ name, lat, lon, pop, country, sub });
+/* ========= Fast one-pass weighted sampler (Efraimidis–Spirakis) ========= */
+function makeKey(w){ if(!(w>0)) return Infinity; return -Math.log(Math.random())/w; }
+
+/* ========= CSV helpers ========= */
+function parseRowToCity(r){
+  const lower={}; for(const k of Object.keys(r)){ lower[normalizeHeader(k).toLowerCase()]=k; }
+  const name=(r[lower['name']] ?? r[lower['ascii name']] ?? r[lower['city']] ?? r[lower['placename']] ?? '').toString().trim();
+  if(!name) return null;
+  let latRaw=r[lower['lat']] ?? r[lower['latitude']] ?? r[lower['lat (deg)']] ?? r[lower['y']];
+  let lonRaw=r[lower['lon']] ?? r[lower['long']] ?? r[lower['lng']] ?? r[lower['longitude']] ?? r[lower['x']];
+  if((latRaw==null || lonRaw==null) && (r['Coordinates']!=null || r['Coordinates ']!=null)){
+    const parts=(r['Coordinates'] ?? r['Coordinates ']).toString().split(',',2); if(parts.length===2){ latRaw=parts[0].trim(); lonRaw=parts[1].trim(); }
   }
-  return out;
-}
-function papaFetch(url){
-  return new Promise((resolve,reject)=>{
-    Papa.parse(url,{download:true,header:true,skipEmptyLines:true,transformHeader:normalizeHeader,
-      complete: res=>resolve(res.data), error: err=>reject(err)});
-  });
-}
-async function loadCityData(){
-  // Prefer the two split files at root; if either fails, try the single file at root
-  try{
-    const [p1,p2] = await Promise.all([papaFetch(CITY_PARTS[0]), papaFetch(CITY_PARTS[1])]);
-    const rows = [...p1,...p2];
-    const parsed = parseRows(rows);
-    if(parsed.length){ console.log('Loaded geonames_part1.csv + geonames_part2.csv'); return parsed; }
-  }catch(e){ console.warn('Split load failed:', e); }
-  try{
-    const single = await papaFetch(CITY_SINGLE);
-    const parsed = parseRows(single);
-    if(parsed.length){ console.log('Loaded geonames_10k.csv'); return parsed; }
-  }catch(e){ console.warn('Single load failed:', e); }
-  throw new Error('Could not load city CSVs from the repo root. Expected geonames_part1.csv + geonames_part2.csv, or geonames_10k.csv.');
+  const lat=parseFloat(String(latRaw).replace(',','.'));
+  const lon=parseFloat(String(lonRaw).replace(',','.'));
+  if(!isFinite(lat)||!isFinite(lon) || lat<-90||lat>90||lon<-180||lon>180) return null;
+  const popRaw=r['Population'] ?? r['population'] ?? r['pop'] ?? r['Population '] ?? r['POP'] ?? null;
+  const pop=Number.isFinite(parseInt(popRaw,10)) ? parseInt(popRaw,10) : null;
+  const country=(r['Country name EN'] ?? r['Country'] ?? r['Country Name'] ?? r['country'] ?? '').toString().trim() || null;
+  const sub=(r['Admin1'] ?? r['Admin1 Name'] ?? r['Sub'] ?? r['Subdivision'] ?? '').toString().trim() || null;
+  return { name, lat, lon, pop, country, sub };
 }
 
-/* ========= IDB API: country mapping & age table ========= */
-let idbCountryList = null; // [{genc:'GB', name:'United Kingdom', norm:'united kingdom'}, ...]
+/* Stream and return ONE weighted-random city from a remote URL */
+function streamPickURL(url){
+  return new Promise((resolve,reject)=>{
+    let best=null;
+    Papa.parse(url,{
+      download:true, header:true, skipEmptyLines:true, worker:true,
+      step: (res)=>{
+        const c=parseRowToCity(res.data); if(!c) return;
+        const w=(c.pop && c.pop>0)?c.pop:1;
+        const key=makeKey(w);
+        if(!best || key<best._key) best={...c,_key:key};
+      },
+      complete: ()=> best?resolve(best):reject(new Error('No valid rows in '+url)),
+      error: (err)=>reject(err)
+    });
+  });
+}
+
+/* Read from local files (upload) and return ONE weighted-random city */
+function pickFromFiles(files){
+  return new Promise((resolve,reject)=>{
+    if(!files || !files.length) return reject(new Error('No files selected'));
+    let best=null, pending=files.length, sawAny=false;
+    for(const f of files){
+      Papa.parse(f,{header:true,skipEmptyLines:true,worker:true,
+        step: (res)=>{
+          const c=parseRowToCity(res.data); if(!c) return;
+          sawAny=true;
+          const w=(c.pop && c.pop>0)?c.pop:1;
+          const key=makeKey(w);
+          if(!best || key<best._key) best={...c,_key:key};
+        },
+        complete: ()=>{ if(--pending===0) best?resolve(best):reject(new Error(sawAny?'No valid rows found.':'No rows found.')); },
+        error: (err)=>{ if(--pending===0) reject(err); }
+      });
+    }
+  });
+}
+
+/* ========= Try remote first (fast timeout), then local upload fallback ========= */
+async function tryRemoteThenLocal(){
+  // Short-circuit: if running file:// origin, remote fetch of sibling files will fail — go straight to upload
+  if(location.protocol === 'file:'){
+    fileWrap.classList.add('open');
+    return new Promise((resolve,reject)=>{
+      fileInput.onchange = async (e)=>{ try{ const city=await pickFromFiles(e.target.files); resolve(city); } catch(err){ reject(err); } };
+    });
+  }
+
+  // Remote attempt with tight timeout so we don't “hang”
+  const timeoutMs = 1800;
+  const withTimeout = (p)=>Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), timeoutMs))]);
+
+  try{
+    // try both parts concurrently; if both fail or timeout, fall back to single
+    const [p1,p2] = await Promise.allSettled([
+      withTimeout(streamPickURL(CITY_PARTS[0])),
+      withTimeout(streamPickURL(CITY_PARTS[1]))
+    ]);
+    const ok = [p1,p2].filter(x=>x.status==='fulfilled').map(x=>x.value);
+    if(ok.length){
+      // choose the globally best (smallest key) across parts
+      return ok.reduce((a,b)=> a._key<b._key ? a : b);
+    }
+  }catch(_){}
+
+  try{
+    return await withTimeout(streamPickURL(CITY_SINGLE));
+  }catch(_){
+    // Remote failed/timed out — fall back to local upload automatically
+    fileWrap.classList.add('open');
+    return new Promise((resolve,reject)=>{
+      fileInput.onchange = async (e)=>{ try{ const city=await pickFromFiles(e.target.files); resolve(city); } catch(err){ reject(err); } };
+    });
+  }
+}
+
+/* ========= IDB (country list + age table) with localStorage cache ========= */
+let idbCountryList=null;
 const NAME_FIX = new Map(Object.entries({
   "cote d'ivoire":"côte d'ivoire",
   "ivory coast":"côte d'ivoire",
@@ -144,13 +210,20 @@ const NAME_FIX = new Map(Object.entries({
   "czech republic":"czechia",
   "macedonia":"tfyr macedonia"
 }));
+function lsGet(k){ try{ return JSON.parse(localStorage.getItem(k)||'null'); }catch{ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} }
+
 async function fetchIdbCountryList(){
   if(idbCountryList) return idbCountryList;
+  const ck = `idb_c_${YEAR}`;
+  const cached = lsGet(ck);
+  if(cached){ idbCountryList=cached; return idbCountryList; }
   const url = `${IDB_BASE}?get=NAME,GENC&YR=${YEAR}&for=genc%20standard%20countries%20and%20areas:*`;
   const res = await fetch(url);
-  if(!res.ok) throw new Error('Failed to load IDB country list');
+  if(!res.ok) throw new Error('IDB country list error');
   const json = await res.json();
   idbCountryList = json.slice(1).map(r=>({ name:r[0], genc:r[1], norm:normName(r[0]) }));
+  lsSet(ck, idbCountryList);
   return idbCountryList;
 }
 function bestCountryMatch(input){
@@ -164,21 +237,22 @@ function bestCountryMatch(input){
   if(starts) return starts;
   return list.find(c=>c.norm.includes(q)) || null;
 }
-async function fetchIdbAgeTable(gencCode){
-  // AGE=0:100, SEX=1 (male) and 2 (female)
-  const url = `${IDB_BASE}?get=AGE,SEX,POP&YR=${YEAR}&AGE=0:100&SEX=1,2&for=genc%20standard%20countries%20and%20areas:${encodeURIComponent(gencCode)}`;
+async function fetchIdbAgeTable(genc){
+  const ck = `idb_${genc}_${YEAR}`;
+  const cached = lsGet(ck); if(cached) return cached;
+  const url = `${IDB_BASE}?get=AGE,SEX,POP&YR=${YEAR}&AGE=0:100&SEX=1,2&for=genc%20standard%20countries%20and%20areas:${encodeURIComponent(genc)}`;
   const res = await fetch(url, {cache:'no-store'});
-  if(!res.ok) throw new Error('Failed to load IDB age table');
+  if(!res.ok) throw new Error('IDB ages error');
   const data = await res.json();
   const rows = data.slice(1);
   const male = Array(101).fill(0), female = Array(101).fill(0);
   for(const r of rows){
-    const age = parseInt(r[0],10); const sex = parseInt(r[1],10); const pop = Number(r[2]);
+    const age = parseInt(r[0],10), sex = parseInt(r[1],10), pop = Number(r[2]);
     if(Number.isFinite(age) && age>=0 && age<=100 && Number.isFinite(pop)){
       if(sex===1) male[age]+=pop; else if(sex===2) female[age]+=pop;
     }
   }
-  return {male, female};
+  const out={male,female}; lsSet(ck,out); return out;
 }
 
 /* ========= Sampling ========= */
@@ -189,88 +263,62 @@ function pickWeightedIndex(weights){
   for(let i=0;i<weights.length;i++){ r -= (weights[i]>0?weights[i]:0); if(r<=0) return i; }
   return weights.length-1;
 }
-function sampleSexFrom(maleArr, femaleArr){
+function sampleSexFrom(maleArr,femaleArr){
   const m = maleArr.reduce((s,x)=>s+x,0), f = femaleArr.reduce((s,x)=>s+x,0);
-  const t = m+f;
-  if(t<=0) return Math.random()<0.5 ? 'Male' : 'Female';
-  return (Math.random()*t < m) ? 'Male' : 'Female';
+  if(m+f<=0) return Math.random()<0.5?'Male':'Female';
+  return (Math.random()*(m+f) < m) ? 'Male' : 'Female';
 }
-function sampleAgeFrom(maleArr, femaleArr, sex){
-  const weights = (sex==='Male') ? maleArr : femaleArr;
-  const idx = pickWeightedIndex(weights);
-  return idx; // 0..100 (100 means 100+)
+function sampleAgeFrom(maleArr,femaleArr,sex){
+  const w = (sex==='Male') ? maleArr : femaleArr;
+  return pickWeightedIndex(w); // 0..100 (100 = 100+)
 }
 
-/* ========= City choosing (population-weighted) ========= */
-function pickWeightedByPopulation(cities){
-  const withPop=cities.filter(c=>Number.isFinite(c.pop)&&c.pop>0);
-  const pool=withPop.length?withPop:cities;
-  const total=withPop.length?withPop.reduce((s,c)=>s+c.pop,0):pool.length;
-  let r=Math.random()*total;
-  if(withPop.length){
-    for(const c of withPop){ r-=c.pop; if(r<=0) return c; }
-    return withPop[withPop.length-1];
-  }else{
-    return pool[Math.floor(Math.random()*pool.length)];
-  }
-}
-
-/* ========= Display ========= */
+/* ========= Show ========= */
 function showPlace(c, sex, age){
   if(currentMarker){ map.removeLayer(currentMarker); currentMarker=null; }
   const label=[c.name, c.sub||null, c.country||null].filter(Boolean).join(' — ');
   if(labelsOverlay && !map.hasLayer(labelsOverlay)) labelsOverlay.addTo(map);
 
   map.flyTo([c.lat, c.lon], 9, {animate:true, duration:2.6, easeLinearity:0.2});
-  const doAfter = ()=>{
-    map.off('moveend', doAfter);
+  const done=()=>{ map.off('moveend', done);
     currentMarker=L.marker([c.lat,c.lon]).addTo(map);
     const popStr = c.pop!=null ? fmt(c.pop) : '—';
     currentMarker.bindPopup(`<b>${label}</b><br>Population: ${popStr}<br>${sex}${age!=null?`, age ${age}`:''}`).openPopup();
   };
-  map.on('moveend', doAfter);
+  map.on('moveend', done);
 
-  placeTitle.textContent = c.name;
-  placeSubEl.textContent = [c.sub, c.country].filter(Boolean).join(' — ') || '—';
-  placePopEl.textContent = c.pop!=null ? fmt(c.pop) : '—';
-  sexLbl.textContent     = sex || '—';
-  ageLbl.textContent     = (age!=null ? String(age) : '—');
+  document.getElementById('placeTitle').textContent = c.name;
+  document.getElementById('placeSub').textContent   = [c.sub, c.country].filter(Boolean).join(' — ') || '—';
+  document.getElementById('placePop').textContent   = c.pop!=null ? fmt(c.pop) : '—';
+  document.getElementById('sexLbl').textContent     = sex;
+  document.getElementById('ageLbl').textContent     = (age!=null ? String(age) : '—');
   panel.classList.add('open');
-}
-
-/* ========= Orchestration ========= */
-async function chooseAndShow(cities){
-  const city = pickWeightedByPopulation(cities);
-  let sex='Male', age=null;
-
-  try{
-    await fetchIdbCountryList();
-    const found = bestCountryMatch(city.country||'');
-    if(!found) throw new Error('No IDB match for country');
-    const tbl = await fetchIdbAgeTable(found.genc);
-    sex = sampleSexFrom(tbl.male, tbl.female);        // empirical sex ratio
-    age = sampleAgeFrom(tbl.male, tbl.female, sex);   // empirical age distribution
-  }catch(e){
-    // graceful fallback if API fails
-    sex = (Math.random()<0.5?'Male':'Female');
-    age = null;
-    console.warn('Age/sex fetch failed, using fallback:', e);
-  }
-  showPlace(city, sex, age);
 }
 
 /* ========= Boot ========= */
 window.addEventListener('DOMContentLoaded', async ()=>{
-  const toastHide = ()=>setTimeout(()=>toast.classList.remove('show'), 1200);
   showToast('Loading…');
   try{
-    const cities = await loadCityData();   // auto-load from repo root
-    await fetchIdbCountryList();           // warm mapping
-    await chooseAndShow(cities);           // pick and show
-    toastHide();
+    // 1) Get a city quickly: remote with short timeout → else instant local upload
+    const city = await tryRemoteThenLocal();
+
+    // 2) Age/sex (empirical) via IDB (cached)
+    await fetchIdbCountryList();
+    let sex='Male', age=null;
+    const match = bestCountryMatch(city.country||'');
+    if(match){
+      const tbl = await fetchIdbAgeTable(match.genc);
+      sex = sampleSexFrom(tbl.male, tbl.female);
+      age = sampleAgeFrom(tbl.male, tbl.female, sex);
+    }else{
+      sex = (Math.random()<0.5 ? 'Male' : 'Female');
+    }
+
+    showPlace(city, sex, age);
   }catch(e){
     console.error(e);
-    showToast('Could not load city CSVs (root). Expected geonames_part1.csv + geonames_part2.csv, or geonames_10k.csv.');
+    showToast('Could not load a city. Select your CSV when prompted.');
+    fileWrap.classList.add('open');
   }
 });
 </script>
