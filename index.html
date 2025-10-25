@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Population-Weighted Place + Age/Sex (IDB API, v4)</title>
+<title>Population-Weighted Place + Age/Sex (IDB API, auto-load CSV parts)</title>
 
 <!-- Leaflet -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous"/>
@@ -20,20 +20,12 @@
   .topbar{position:fixed;z-index:1000;top:0;left:0;right:0;background:#0e1117;border-bottom:1px solid var(--border);
           display:flex;align-items:center;gap:10px;justify-content:space-between;padding:10px 12px;box-shadow:0 2px 12px rgba(0,0,0,.35);}
   .brand{font-size:18px;font-weight:800;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-  .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
-  .muted{color:var(--muted);font-size:13px;}
-  select{background:#0d0f13;border:1px solid var(--border);color:#e9eef6;border-radius:10px;padding:8px 10px;}
-  label.file{display:inline-flex;align-items:center;gap:8px;background:#1a2233;border:1px solid #2a3347;border-radius:10px;padding:8px 10px;cursor:pointer;}
-  input[type="file"]{accent-color:var(--accent);}
   #map{position:fixed;top:56px;left:0;right:0;bottom:0;min-height:60vh;}
   .panel{position:fixed;top:64px;left:12px;background:#0d0f13;border:1px solid var(--border);border-radius:12px;padding:12px;max-width:360px;display:none;}
   .panel.open{display:block;}
   .panel h1{margin:0 0 4px;font-size:20px;letter-spacing:.2px;}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;margin-top:8px;font-size:13px;color:var(--muted);}
   .kv b{color:var(--text);}
-  #dropzone{position:fixed;inset:56px 0 0 0;display:flex;align-items:center;justify-content:center;border:2px dashed #2a3347;color:#97a0b2;
-            font-weight:600;letter-spacing:.3px;pointer-events:none;opacity:0;transition:.2s;}
-  #dropzone.show{opacity:1;pointer-events:auto;background:rgba(20,24,32,.6);backdrop-filter:blur(2px);}
   .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#111827;border:1px solid #263044;border-radius:10px;
          padding:10px 14px;font-weight:600;letter-spacing:.2px;display:none;}
   .toast.show{display:block;}
@@ -43,23 +35,9 @@
 
 <div class="topbar">
   <div class="brand">Population-Weighted Place + Age/Sex</div>
-  <div class="controls">
-    <label class="file">
-      <span>Choose city CSV(s):</span>
-      <input id="fileInput" type="file" accept=".csv,text/csv" multiple>
-    </label>
-    <label>Sex mode:
-      <select id="sexMode">
-        <option value="50" selected>50:50 (exact)</option>
-        <option value="real">Use country sex ratio (IDB)</option>
-      </select>
-    </label>
-    <span class="muted">Auto-loads /data/geonames_part1.csv + /data/geonames_part2.csv, or /data/geonames_10k.csv. Ages/sex from U.S. Census IDB (2024).</span>
-  </div>
 </div>
 
 <div id="map"></div>
-<div id="dropzone">Drop your <b style="margin-left:6px;">city CSV(s)</b> here</div>
 
 <div id="infoPanel" class="panel">
   <h1 id="placeTitle">—</h1>
@@ -78,7 +56,7 @@
 const YEAR = 2024; // target year for age distribution
 const CITY_PARTS = ['data/geonames_part1.csv','data/geonames_part2.csv'];
 const CITY_SINGLE = 'data/geonames_10k.csv';
-const IDB_BASE = 'https://api.census.gov/data/timeseries/idb/1year'; // U.S. Census IDB API (single-year)
+const IDB_BASE = 'https://api.census.gov/data/timeseries/idb/1year'; // U.S. Census IDB
 
 /* ========= Map (v3.2 dynamics) ========= */
 let map=null, labelsOverlay=null, currentMarker=null;
@@ -89,16 +67,13 @@ let map=null, labelsOverlay=null, currentMarker=null;
   map.setMaxBounds([[-85,-200],[85,200]]);
 })();
 
-/* ========= UI ========= */
-const fileInput  = document.getElementById('fileInput');
-const dropzone   = document.getElementById('dropzone');
+/* ========= UI helpers ========= */
 const panel      = document.getElementById('infoPanel');
 const placeTitle = document.getElementById('placeTitle');
 const placeSubEl = document.getElementById('placeSub');
 const placePopEl = document.getElementById('placePop');
 const sexLbl     = document.getElementById('sexLbl');
 const ageLbl     = document.getElementById('ageLbl');
-const sexModeSel = document.getElementById('sexMode');
 const toast      = document.getElementById('toast');
 
 function showToast(msg){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'), 1400); }
@@ -138,6 +113,7 @@ function papaFetch(url){
   });
 }
 async function loadCityData(){
+  // Expect the two split files; if either fails, try the single file
   try{
     const [p1,p2] = await Promise.all([papaFetch(CITY_PARTS[0]), papaFetch(CITY_PARTS[1])]);
     const rows = [...p1,...p2];
@@ -149,57 +125,50 @@ async function loadCityData(){
     const parsed = parseRows(single);
     if(parsed.length) return parsed;
   }catch(_){}
-  return null; // fall back to user upload
+  throw new Error('Could not load city CSVs from /data/.');
 }
 
-/* ========= IDB API helpers (single-year ages by sex) ========= */
-/* We’ll fetch a master list of {GENC, NAME} once, then map your CSV’s country names to the best match. */
-let idbCountryList = null; // [{genc:'GB', name:'United Kingdom'}, ...]
+/* ========= IDB API: country mapping & age table ========= */
+let idbCountryList = null; // [{genc:'GB', name:'United Kingdom', norm:'united kingdom'}, ...]
 const NAME_FIX = new Map(Object.entries({
-  // small alias fixups for common variants
-  'cote d\'ivoire':'côte d\'ivoire',
-  'ivory coast':'côte d\'ivoire',
-  'congo (kinshasa)':'democratic republic of the congo',
-  'congo, democratic republic of the':'democratic republic of the congo',
-  'congo (brazzaville)':'congo',
-  'russia':'russian federation',
-  'south korea':'republic of korea',
-  'north korea':'people\'s republic of korea',
-  'swaziland':'eswatini',
-  'czech republic':'czechia',
-  'macedonia':'tfyr macedonia',
+  "cote d'ivoire":"côte d'ivoire",
+  "ivory coast":"côte d'ivoire",
+  "congo (kinshasa)":"democratic republic of the congo",
+  "congo, democratic republic of the":"democratic republic of the congo",
+  "congo (brazzaville)":"congo",
+  "russia":"russian federation",
+  "south korea":"republic of korea",
+  "north korea":"people's republic of korea",
+  "swaziland":"eswatini",
+  "czech republic":"czechia",
+  "macedonia":"tfyr macedonia"
 }));
-
 async function fetchIdbCountryList(){
   if(idbCountryList) return idbCountryList;
   const url = `${IDB_BASE}?get=NAME,GENC&YR=${YEAR}&for=genc%20standard%20countries%20and%20areas:*`;
   const res = await fetch(url);
   if(!res.ok) throw new Error('Failed to load IDB country list');
-  const json = await res.json(); // first row is headers
-  const rows = json.slice(1).map(r=>({ name: r[0], genc: r[1] }));
-  // normalize names for matching
-  idbCountryList = rows.map(r=>({ genc:r.genc, name:r.name, norm: normName(r.name) }));
+  const json = await res.json();
+  idbCountryList = json.slice(1).map(r=>({ name:r[0], genc:r[1], norm:normName(r[0]) }));
   return idbCountryList;
 }
 function bestCountryMatch(input){
   if(!input) return null;
   let q = normName(input);
   if(NAME_FIX.has(q)) q = NAME_FIX.get(q);
-  // exact norm match
-  const exact = idbCountryList.find(c=>c.norm===q);
+  const list = idbCountryList || [];
+  const exact = list.find(c=>c.norm===q);
   if(exact) return exact;
-  // startswith / includes fallback
-  const starts = idbCountryList.find(c=>c.norm.startsWith(q)) || idbCountryList.find(c=>q.startsWith(c.norm));
+  const starts = list.find(c=>c.norm.startsWith(q)) || list.find(c=>q.startsWith(c.norm));
   if(starts) return starts;
-  // very rough contains (last resort)
-  return idbCountryList.find(c=>c.norm.includes(q)) || null;
+  return list.find(c=>c.norm.includes(q)) || null;
 }
 async function fetchIdbAgeTable(gencCode){
   // AGE=0:100, SEX=1 (male) and 2 (female)
   const url = `${IDB_BASE}?get=AGE,SEX,POP&YR=${YEAR}&AGE=0:100&SEX=1,2&for=genc%20standard%20countries%20and%20areas:${encodeURIComponent(gencCode)}`;
   const res = await fetch(url, {cache:'no-store'});
   if(!res.ok) throw new Error('Failed to load IDB age table');
-  const data = await res.json(); // [ ["AGE","SEX","POP","time","NAME","GENC","..."], [...], ... ]
+  const data = await res.json();
   const rows = data.slice(1);
   const male = Array(101).fill(0), female = Array(101).fill(0);
   for(const r of rows){
@@ -211,7 +180,7 @@ async function fetchIdbAgeTable(gencCode){
   return {male, female};
 }
 
-/* ========= Sampling from distributions ========= */
+/* ========= Sampling ========= */
 function pickWeightedIndex(weights){
   let total=0; for(const w of weights){ total += (w>0? w:0); }
   if(total<=0) return Math.floor(Math.random()*weights.length);
@@ -219,8 +188,7 @@ function pickWeightedIndex(weights){
   for(let i=0;i<weights.length;i++){ r -= (weights[i]>0?weights[i]:0); if(r<=0) return i; }
   return weights.length-1;
 }
-function sampleSexFrom(maleArr, femaleArr, mode){
-  if(mode==='50') return Math.random()<0.5 ? 'Male' : 'Female';
+function sampleSexFrom(maleArr, femaleArr){
   const m = maleArr.reduce((s,x)=>s+x,0), f = femaleArr.reduce((s,x)=>s+x,0);
   const t = m+f;
   if(t<=0) return Math.random()<0.5 ? 'Male' : 'Female';
@@ -261,11 +229,11 @@ function showPlace(c, sex, age){
   };
   map.on('moveend', doAfter);
 
-  document.getElementById('placeTitle').textContent = c.name;
-  document.getElementById('placeSub').textContent = [c.sub, c.country].filter(Boolean).join(' — ') || '—';
-  document.getElementById('placePop').textContent = c.pop!=null ? fmt(c.pop) : '—';
-  document.getElementById('sexLbl').textContent   = sex || '—';
-  document.getElementById('ageLbl').textContent   = (age!=null ? String(age) : '—');
+  placeTitle.textContent = c.name;
+  placeSubEl.textContent = [c.sub, c.country].filter(Boolean).join(' — ') || '—';
+  placePopEl.textContent = c.pop!=null ? fmt(c.pop) : '—';
+  sexLbl.textContent     = sex || '—';
+  ageLbl.textContent     = (age!=null ? String(age) : '—');
   panel.classList.add('open');
 }
 
@@ -275,76 +243,31 @@ async function chooseAndShow(cities){
   let sex='Male', age=null;
 
   try{
-    // 1) map country name -> GENC (ISO-2-ish) via live list
-    const list = await fetchIdbCountryList();
+    await fetchIdbCountryList();
     const found = bestCountryMatch(city.country||'');
     if(!found) throw new Error('No IDB match for country');
-    // 2) fetch age-by-sex table
     const tbl = await fetchIdbAgeTable(found.genc);
-    // 3) sample sex & age
-    sex = sampleSexFrom(tbl.male, tbl.female, sexModeSel.value);
-    age = sampleAgeFrom(tbl.male, tbl.female, sex);
+    sex = sampleSexFrom(tbl.male, tbl.female);        // empirical sex ratio
+    age = sampleAgeFrom(tbl.male, tbl.female, sex);   // empirical age distribution
   }catch(e){
-    // graceful fallback
-    sex = (sexModeSel.value==='50' ? (Math.random()<0.5?'Male':'Female') : 'Male');
+    // graceful fallback if API fails (rare)
+    sex = (Math.random()<0.5?'Male':'Female');
     age = null;
     console.warn('Age/sex fetch failed, using fallback:', e);
   }
   showPlace(city, sex, age);
 }
 
-/* ========= Upload/drag handlers (accept 1 or 2 files) ========= */
-function parseUploadedFiles(fileList){
-  return new Promise((resolve,reject)=>{
-    const files = Array.from(fileList||[]);
-    if(!files.length) return reject(new Error('No files'));
-    const results=[]; let done=0;
-    files.forEach(f=>{
-      Papa.parse(f,{header:true,skipEmptyLines:true,transformHeader:normalizeHeader,
-        complete: res=>{ results.push(res.data); if(++done===files.length) resolve([].concat(...results)); },
-        error: _=>{ if(++done===files.length) resolve([].concat(...results)); }
-      });
-    });
-  });
-}
-function normalizeHeader(h){ return (h||'').toString().replace(/^\uFEFF/,'').trim(); }
-function looksLikeHTML(text){ return /^\s*<!doctype html>|^\s*<html/i.test(text); }
-
-function handleFiles(files){
-  if(!files || !files.length) return;
-  showToast('Parsing city file(s)…');
-  parseUploadedFiles(files).then(rows=>{
-    const cities=parseRows(rows);
-    if(!cities.length) return alert('No valid rows with name/lat/lon were found.');
-    chooseAndShow(cities);
-  }).catch(err=>alert(err.message||String(err)));
-}
-fileInput.addEventListener('change',(e)=>handleFiles(e.target.files));
-['dragenter','dragover'].forEach(ev=>{
-  window.addEventListener(ev,(e)=>{ e.preventDefault(); e.stopPropagation(); dropzone.classList.add('show'); });
-});
-['dragleave','drop'].forEach(ev=>{
-  window.addEventListener(ev,(e)=>{ e.preventDefault(); e.stopPropagation(); dropzone.classList.remove('show'); });
-});
-window.addEventListener('drop',(e)=>handleFiles(e.dataTransfer && e.dataTransfer.files));
-
 /* ========= Boot ========= */
 window.addEventListener('DOMContentLoaded', async ()=>{
   showToast('Loading…');
   try{
-    // Preload IDB country list so first pick is fast
-    await fetchIdbCountryList();
-  }catch(e){ console.warn('IDB country list fetch warning:', e); }
-
-  try{
-    const auto = await loadCityData();
-    if(auto && auto.length){
-      chooseAndShow(auto);
-    }else{
-      showToast('Upload one or two city CSV files to start');
-    }
-  }catch(_){
-    showToast('Upload one or two city CSV files to start');
+    const cities = await loadCityData();   // auto-load from /data/
+    await fetchIdbCountryList();           // warm the mapping
+    await chooseAndShow(cities);           // pick and show
+  }catch(e){
+    console.error(e);
+    showToast('Could not load city CSVs from /data/.');
   }
 });
 </script>
