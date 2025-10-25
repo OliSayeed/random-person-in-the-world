@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Population-Weighted Place + Age/Sex (IDB API, auto-load CSV parts)</title>
+<title>Population-Weighted Place + Age/Sex (root CSVs, IDB API)</title>
 
 <!-- Leaflet -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous"/>
@@ -53,9 +53,10 @@
 
 <script>
 /* ========= Config ========= */
-const YEAR = 2024; // target year for age distribution
-const CITY_PARTS = ['data/geonames_part1.csv','data/geonames_part2.csv'];
-const CITY_SINGLE = 'data/geonames_10k.csv';
+const YEAR = 2024; // change to 2025 later if you like
+// All files expected at repo root (same folder as index.html)
+const CITY_PARTS = ['geonames_part1.csv','geonames_part2.csv'];
+const CITY_SINGLE = 'geonames_10k.csv';
 const IDB_BASE = 'https://api.census.gov/data/timeseries/idb/1year'; // U.S. Census IDB
 
 /* ========= Map (v3.2 dynamics) ========= */
@@ -113,19 +114,19 @@ function papaFetch(url){
   });
 }
 async function loadCityData(){
-  // Expect the two split files; if either fails, try the single file
+  // Prefer the two split files at root; if either fails, try the single file at root
   try{
     const [p1,p2] = await Promise.all([papaFetch(CITY_PARTS[0]), papaFetch(CITY_PARTS[1])]);
     const rows = [...p1,...p2];
     const parsed = parseRows(rows);
-    if(parsed.length) return parsed;
-  }catch(_){}
+    if(parsed.length){ console.log('Loaded geonames_part1.csv + geonames_part2.csv'); return parsed; }
+  }catch(e){ console.warn('Split load failed:', e); }
   try{
     const single = await papaFetch(CITY_SINGLE);
     const parsed = parseRows(single);
-    if(parsed.length) return parsed;
-  }catch(_){}
-  throw new Error('Could not load city CSVs from /data/.');
+    if(parsed.length){ console.log('Loaded geonames_10k.csv'); return parsed; }
+  }catch(e){ console.warn('Single load failed:', e); }
+  throw new Error('Could not load city CSVs from the repo root. Expected geonames_part1.csv + geonames_part2.csv, or geonames_10k.csv.');
 }
 
 /* ========= IDB API: country mapping & age table ========= */
@@ -250,7 +251,7 @@ async function chooseAndShow(cities){
     sex = sampleSexFrom(tbl.male, tbl.female);        // empirical sex ratio
     age = sampleAgeFrom(tbl.male, tbl.female, sex);   // empirical age distribution
   }catch(e){
-    // graceful fallback if API fails (rare)
+    // graceful fallback if API fails
     sex = (Math.random()<0.5?'Male':'Female');
     age = null;
     console.warn('Age/sex fetch failed, using fallback:', e);
@@ -260,14 +261,16 @@ async function chooseAndShow(cities){
 
 /* ========= Boot ========= */
 window.addEventListener('DOMContentLoaded', async ()=>{
+  const toastHide = ()=>setTimeout(()=>toast.classList.remove('show'), 1200);
   showToast('Loading…');
   try{
-    const cities = await loadCityData();   // auto-load from /data/
-    await fetchIdbCountryList();           // warm the mapping
+    const cities = await loadCityData();   // auto-load from repo root
+    await fetchIdbCountryList();           // warm mapping
     await chooseAndShow(cities);           // pick and show
+    toastHide();
   }catch(e){
     console.error(e);
-    showToast('Could not load city CSVs from /data/.');
+    showToast('Could not load city CSVs (root). Expected geonames_part1.csv + geonames_part2.csv, or geonames_10k.csv.');
   }
 });
 </script>
