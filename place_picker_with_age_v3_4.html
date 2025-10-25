@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Population-Weighted Place + Age/Sex (v3.4 – auto-parse WPP XLSX)</title>
+
+<!-- Leaflet -->
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+  crossorigin="anonymous"
+/>
+<script
+  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+  crossorigin="anonymous"
+></script>
+
+<!-- Papa Parse (for your city CSV upload) -->
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" crossorigin="anonymous"></script>
+
+<!-- SheetJS to read the WPP Excel files in the browser -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" integrity="" crossorigin="anonymous"></script>
+
+<style>
+  :root { --bg:#0b0c0f; --panel:#111317; --muted:#a9b0bd; --text:#e9eef6;
+          --accent:#6aa0ff; --good:#22c55e; --mid:#f59e0b; --border:#1f2430; }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);
+            font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Inter,"Helvetica Neue",Arial;}
+  .leaflet-container{background:#0a0d12;}
+
+  .topbar{position:fixed;z-index:1000;top:0;left:0;right:0;background:#0e1117;border-bottom:1px solid var(--border);
+          display:flex;align-items:center;gap:10px;justify-content:space-between;padding:10px 12px;box-shadow:0 2px 12px rgba(0,0,0,.35);}
+  .brand{font-size:18px;font-weight:800;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .btn{appearance:none;border:none;cursor:pointer;padding:8px 10px;border-radius:10px;background:#1a2233;color:#fff;
+       transition:transform .02s ease,opacity .2s ease,background .2s ease;font-weight:600;letter-spacing:.2px;}
+  .btn:hover{background:#1d2740;} .btn:active{transform:translateY(1px);} .btn.accent{background:var(--accent);color:#081021;}
+  .muted{color:var(--muted);font-size:13px;}
+  select, .switch{background:#0d0f13;border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 10px;}
+
+  #map{position:fixed;top:56px;left:0;right:0;bottom:0;min-height:60vh;}
+  .panel{position:fixed;top:64px;left:12px;background:#0d0f13;border:1px solid var(--border);border-radius:12px;padding:12px;max-width:360px;display:none;}
+  .panel.open{display:block;}
+  .panel h1{margin:0 0 4px;font-size:20px;letter-spacing:.2px;}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;margin-top:8px;font-size:13px;color:var(--muted);}
+  .kv b{color:var(--text);}
+
+  #dropzone{position:fixed;inset:56px 0 0 0;display:flex;align-items:center;justify-content:center;border:2px dashed #2a3347;color:#97a0b2;
+            font-weight:600;letter-spacing:.3px;pointer-events:none;opacity:0;transition:.2s;}
+  #dropzone.show{opacity:1;pointer-events:auto;background:rgba(20,24,32,.6);backdrop-filter:blur(2px);}
+
+  .toast{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#111827;border:1px solid #263044;border-radius:10px;
+         padding:10px 14px;font-weight:600;letter-spacing:.2px;display:none;}
+  .toast.show{display:block;}
+
+  label.file{display:inline-flex;align-items:center;gap:8px;background:#1a2233;border:1px solid #2a3347;border-radius:10px;padding:8px 10px;cursor:pointer;}
+  input[type="file"]{accent-color:var(--accent);}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">Population-Weighted Place + Age/Sex (v3.4)</div>
+  <div class="controls">
+    <label class="file">
+      <span>Choose city CSV:</span>
+      <input id="fileInput" type="file" accept=".csv,text/csv">
+    </label>
+    <label class="switch">Sex mode:
+      <select id="sexMode">
+        <option value="50" selected>50:50 (exact)</option>
+        <option value="real">Use country sex ratio</option>
+      </select>
+    </label>
+    <span class="muted">WPP files auto-loaded from <code>/data</code></span>
+  </div>
+</div>
+
+<div id="map"></div>
+<div id="dropzone">Drop your <b style="margin-left:6px;">geonames_10k.csv</b> here</div>
+
+<div id="infoPanel" class="panel">
+  <h1 id="placeTitle">—</h1>
+  <div class="kv">
+    <div>Where</div><div><b id="placeSub">—</b></div>
+    <div>Population</div><div><b id="placePop">—</b></div>
+    <div>Random sex</div><div><b id="sexLbl">—</b></div>
+    <div>Random age</div><div><b id="ageLbl">—</b></div>
+  </div>
+</div>
+
+<div id="toast" class="toast">Loading…</div>
+
+<script>
+// ---------- Config: POINT THESE TO THE FILES YOU UPLOADED IN /data ----------
+// Upload the two UN WPP XLSX you downloaded to your repo's /data/ folder,
+// and either rename them to the simple names below, or replace these paths
+// with your actual filenames.
+const WPP_MALE_PATHS = [
+  'data/wpp_single_age_male.xlsx',   // simple name (recommended)
+  // put your actual filename here if different, e.g.:
+  // 'data/WPP2024_POP_SINGLE_AGE_MALE.xlsx',
+];
+const WPP_FEMALE_PATHS = [
+  'data/wpp_single_age_female.xlsx',
+  // 'data/WPP2024_POP_SINGLE_AGE_FEMALE.xlsx',
+];
+const WPP_YEAR = 2024;
+
+// ---------- Map init (same dynamics as v3.2) ----------
+let map=null, labelsOverlay=null, currentMarker=null;
+(function initMap(){
+  if(typeof L==='undefined'){ alert('Leaflet failed to load.'); return; }
+  map=L.map('map',{minZoom:1.5,worldCopyJump:true,attributionControl:true}).setView([20,0],2);
+  const baseNoLabels=L.tileLayer('https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png',{attribution:'© OpenStreetMap © CARTO'}).addTo(map);
+  labelsOverlay=L.tileLayer('https://basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png',{attribution:''});
+  map.setMaxBounds([[-85,-200],[85,200]]);
+})();
+
+// ---------- UI els ----------
+const fileInput  = document.getElementById('fileInput');
+const dropzone   = document.getElementById('dropzone');
+const panel      = document.getElementById('infoPanel');
+const placeTitle = document.getElementById('placeTitle');
+const placeSubEl = document.getElementById('placeSub');
+const placePopEl = document.getElementById('placePop');
+const sexLbl     = document.getElementById('sexLbl');
+const ageLbl     = document.getElementById('ageLbl');
+const sexModeSel = document.getElementById('sexMode');
+const toast      = document.getElementById('toast');
+
+function showToast(msg){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'), 1400); }
+function fmt(n){ try{return Number(n).toLocaleString();}catch(_){return String(n);} }
+function normName(s){ return (s||'').toString().normalize('NFD').replace(/\p{Diacritic}/gu,'').trim().toLowerCase(); }
+function ageToInt(s){ const m=String(s).match(/\d+/); return m ? Math.min(100, parseInt(m[0],10)) : 100; } // 100+ -> 100
+
+// ---------- City CSV parsing (same as your v3.x) ----------
+let cachedCities=null;
+function normalizeHeader(h){ return (h||'').toString().replace(/^\uFEFF/,'').trim(); }
+function looksLikeHTML(text){ return /^\s*<!doctype html>|^\s*<html/i.test(text); }
+function parseRows(rows){
+  const out=[];
+  for(const r of rows){
+    const keys=Object.keys(r); if(!keys.length) continue;
+    const lower={}; for(const k of keys){ lower[normalizeHeader(k).toLowerCase()]=k; }
+    const name=(r[lower['name']] ?? r[lower['ascii name']] ?? r[lower['city']] ?? r[lower['placename']] ?? '').toString().trim();
+    if(!name) continue;
+    let latRaw=r[lower['lat']] ?? r[lower['latitude']] ?? r[lower['lat (deg)']] ?? r[lower['y']];
+    let lonRaw=r[lower['lon']] ?? r[lower['long']] ?? r[lower['lng']] ?? r[lower['longitude']] ?? r[lower['x']];
+    if((latRaw==null || lonRaw==null) && (r['Coordinates']!=null || r['Coordinates ']!=null)){
+      const parts=(r['Coordinates'] ?? r['Coordinates ']).toString().split(',',2); if(parts.length===2){ latRaw=parts[0].trim(); lonRaw=parts[1].trim(); }
+    }
+    const lat=parseFloat(String(latRaw).replace(',','.'));
+    const lon=parseFloat(String(lonRaw).replace(',','.'));
+    if(!isFinite(lat)||!isFinite(lon)) continue;
+    if(lat<-90||lat>90||lon<-180||lon>180) continue;
+    const popRaw=r['Population'] ?? r['population'] ?? r['pop'] ?? r['Population '] ?? r['POP'] ?? null;
+    const pop=Number.isFinite(parseInt(popRaw,10)) ? parseInt(popRaw,10) : null;
+    const country=(r['Country name EN'] ?? r['Country'] ?? r['Country Name'] ?? r['country'] ?? '').toString().trim() || null;
+    const sub=(r['Admin1'] ?? r['Admin1 Name'] ?? r['Sub'] ?? r['Subdivision'] ?? '').toString().trim() || null;
+    out.push({ name, lat, lon, pop, country, sub });
+  }
+  return out;
+}
+function parseCSVFile(file){
+  return new Promise((resolve,reject)=>{
+    Papa.parse(file,{
+      header:true, skipEmptyLines:true, transformHeader: normalizeHeader,
+      complete: function(res){
+        try{
+          const fields=res.meta?.fields||[];
+          if(!fields.length){
+            const reader=new FileReader();
+            reader.onload=()=>{
+              const t=reader.result;
+              if(looksLikeHTML(t)) reject(new Error('Got HTML instead of CSV.'));
+              else reject(new Error('No header row detected.'));
+            };
+            reader.readAsText(file); return;
+          }
+          const cities=parseRows(res.data);
+          if(!cities.length) return reject(new Error('No valid rows with name/lat/lon were found.'));
+          resolve(cities);
+        }catch(err){ reject(err); }
+      },
+      error: err=>reject(err)
+    });
+  });
+}
+
+// ---------- WPP loader: read Male+Female XLSX from /data and build fast lookup ----------
+let wppByCountry = new Map(); // normalized country -> [{age,male,female}], 2024 only
+let wppTotals = { male:0, female:0, byAge:[] };
+
+async function fetchArrayBuffer(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error('Failed to fetch '+url);
+  return await r.arrayBuffer();
+}
+async function tryFirst(pathList){
+  for(const p of pathList){
+    try{ return await fetchArrayBuffer(p); }catch(_){}
+  }
+  throw new Error('None of the candidate paths worked: '+pathList.join(', '));
+}
+
+function parseWPPXLSX(arrayBuffer, sex){
+  // Returns array of rows: {country, year, ageNum, value} where value is PEOPLE (not thousands)
+  const wb = XLSX.read(new Uint8Array(arrayBuffer), {type:'array'});
+  const wsName = wb.SheetNames[0];
+  const ws = wb.Sheets[wsName];
+  const raw = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+  if(!raw.length) return [];
+  const headers = raw[0].map(x=>String(x||'').toLowerCase());
+  // Try to find columns
+  const idxLoc  = headers.findIndex(h=>/^(location|country|area)/.test(h));
+  const idxYear = headers.findIndex(h=>/^(time|year)/.test(h));
+  const idxAge  = headers.findIndex(h=>/^age/.test(h));
+  // Value column = last non-empty column by default (WPP keeps it 4th)
+  let idxVal = headers.length-1;
+  // Sometimes the last column is notes; if second-to-last is numeric header, use that
+  for(let i=headers.length-1;i>=0;i--){
+    const name = headers[i];
+    if(name && !/note|code|id/.test(name)){ idxVal = i; break; }
+  }
+  const out = [];
+  for(let r=1;r<raw.length;r++){
+    const row = raw[r];
+    if(!row) continue;
+    const loc=row[idxLoc], yr=row[idxYear], age=row[idxAge], val=row[idxVal];
+    if(loc==null || yr==null || age==null || val==null) continue;
+    const year = parseInt(yr,10);
+    if(year!==WPP_YEAR) continue;
+    const ageNum = ageToInt(age);
+    const v = Number(val)*1000; // WPP values are in thousands
+    if(!Number.isFinite(v)) continue;
+    out.push({country:String(loc).trim(), year, ageNum, value:v, sex});
+  }
+  return out;
+}
+
+async function loadWPP(){
+  try{
+    const maleBuf = await tryFirst(WPP_MALE_PATHS);
+    const femBuf  = await tryFirst(WPP_FEMALE_PATHS);
+    const maleRows = parseWPPXLSX(maleBuf, 'male');
+    const femRows  = parseWPPXLSX(femBuf, 'female');
+    const byCountry = new Map();
+    let gm=0,gf=0;
+    function addRow(r){
+      const key = normName(r.country);
+      if(!byCountry.has(key)) byCountry.set(key, new Map()); // age -> {male,female}
+      const ageMap = byCountry.get(key);
+      if(!ageMap.has(r.ageNum)) ageMap.set(r.ageNum, {male:0,female:0});
+      const rec = ageMap.get(r.ageNum);
+      rec[r.sex] += r.value;
+    }
+    maleRows.forEach(addRow); femRows.forEach(addRow);
+    // Materialize arrays and compute totals
+    wppByCountry.clear();
+    const globalByAge = new Map(); // age -> {male,female}
+    for(const [key, ageMap] of byCountry.entries()){
+      const arr = [];
+      for(const [age, rec] of ageMap.entries()){
+        arr.push({age, male:rec.male, female:rec.female});
+        gm += rec.male; gf += rec.female;
+        if(!globalByAge.has(age)) globalByAge.set(age, {male:0,female:0});
+        const g = globalByAge.get(age); g.male += rec.male; g.female += rec.female;
+      }
+      arr.sort((a,b)=>a.age-b.age);
+      wppByCountry.set(key, arr);
+    }
+    wppTotals.male = gm; wppTotals.female = gf;
+    wppTotals.byAge = Array.from(globalByAge.entries()).map(([age,rec])=>({age, male:rec.male, female:rec.female})).sort((a,b)=>a.age-b.age);
+    console.log('[WPP] Loaded', wppByCountry.size, 'countries for', WPP_YEAR);
+  }catch(e){
+    console.warn('WPP load failed:', e);
+    // leave maps empty; app will fall back to 50:50 and null age
+  }
+}
+
+// ---------- Sampling using WPP ----------
+function pickWeighted(items, weightFn){
+  const n=items.length; if(!n) return null;
+  let total=0; for(const it of items){ total += Math.max(0, weightFn(it)||0); }
+  if(total<=0) return items[Math.floor(Math.random()*n)];
+  let r=Math.random()*total;
+  for(const it of items){ r -= Math.max(0, weightFn(it)||0); if(r<=0) return it; }
+  return items[n-1];
+}
+function sampleSex(countryName, mode){
+  if(mode==='50') return Math.random()<0.5 ? 'Male' : 'Female';
+  const rows = wppByCountry.get(normName(countryName||''));
+  if(!rows || !rows.length){
+    const t=wppTotals.male + wppTotals.female;
+    if(t<=0) return Math.random()<0.5 ? 'Male' : 'Female';
+    return (Math.random()*t < wppTotals.male) ? 'Male' : 'Female';
+  }
+  const m = rows.reduce((s,x)=>s+x.male,0);
+  const f = rows.reduce((s,x)=>s+x.female,0);
+  const t = m+f; if(t<=0) return Math.random()<0.5 ? 'Male' : 'Female';
+  return (Math.random()*t < m) ? 'Male' : 'Female';
+}
+function sampleAge(countryName, sex){
+  const rows = wppByCountry.get(normName(countryName||'')) || wppTotals.byAge;
+  if(!rows || !rows.length) return null;
+  const weight = (r)=> sex==='Male' ? r.male : r.female;
+  return pickWeighted(rows, weight)?.age ?? null;
+}
+
+// ---------- Show chosen place + sampled sex/age (same fly as v3.2) ----------
+function showPlace(c){
+  if(!map) return;
+  if(currentMarker){ map.removeLayer(currentMarker); currentMarker=null; }
+  const label=[c.name, c.sub||null, c.country||null].filter(Boolean).join(' — ');
+
+  const mode = sexModeSel.value;
+  const sex  = c.country ? sampleSex(c.country, mode) : (Math.random()<0.5 ? 'Male':'Female');
+  const age  = c.country ? sampleAge(c.country, sex) : null;
+
+  if(labelsOverlay && !map.hasLayer(labelsOverlay)) labelsOverlay.addTo(map);
+  map.flyTo([c.lat, c.lon], 9, {animate:true, duration:2.6, easeLinearity:0.2});
+  const doAfter = ()=>{
+    map.off('moveend', doAfter);
+    currentMarker=L.marker([c.lat,c.lon]).addTo(map);
+    const popStr = c.pop!=null ? fmt(c.pop) : '—';
+    currentMarker.bindPopup(`<b>${label}</b><br>Population: ${popStr}<br>${sex}${age!=null?`, age ${age}`:''}`).openPopup();
+  };
+  map.on('moveend', doAfter);
+
+  placeTitle.textContent = c.name;
+  placeSubEl.textContent = [c.sub, c.country].filter(Boolean).join(' — ') || '—';
+  placePopEl.textContent = c.pop!=null ? fmt(c.pop) : '—';
+  sexLbl.textContent     = sex;
+  ageLbl.textContent     = (age!=null ? String(age) : '—');
+  panel.classList.add('open');
+}
+
+// ---------- Weighted pick by population ----------
+function pickWeightedByPopulation(cities){
+  const withPop=cities.filter(c=>Number.isFinite(c.pop)&&c.pop>0);
+  const pool=withPop.length?withPop:cities;
+  const total=withPop.length?withPop.reduce((s,c)=>s+c.pop,0):pool.length;
+  let r=Math.random()*total;
+  if(withPop.length){
+    for(const c of withPop){ r-=c.pop; if(r<=0) return c; }
+    return withPop[withPop.length-1];
+  }else{
+    return pool[Math.floor(Math.random()*pool.length)];
+  }
+}
+
+// ---------- Handlers ----------
+function handleFiles(files){
+  const f=files && files[0]; if(!f) return;
+  showToast('Parsing city file…');
+  parseCSVFile(f).then(cities=>{
+    cachedCities=cities;
+    showToast('Picking a place…');
+    const chosen=pickWeightedByPopulation(cities);
+    showPlace(chosen);
+  }).catch(err=>{
+    alert(err.message || String(err));
+  }).finally(()=>{ fileInput.value=''; });
+}
+
+fileInput.addEventListener('change',(e)=>handleFiles(e.target.files));
+['dragenter','dragover'].forEach(ev=>{
+  window.addEventListener(ev,(e)=>{ e.preventDefault(); e.stopPropagation(); dropzone.classList.add('show'); });
+});
+['dragleave','drop'].forEach(ev=>{
+  window.addEventListener(ev,(e)=>{ e.preventDefault(); e.stopPropagation(); dropzone.classList.remove('show'); });
+});
+window.addEventListener('drop',(e)=>handleFiles(e.dataTransfer && e.dataTransfer.files));
+
+// Load WPP on boot (non-blocking)
+window.addEventListener('DOMContentLoaded', ()=>{
+  loadWPP().then(()=>console.log('WPP ready')).catch(()=>console.warn('WPP not loaded; falling back to 50:50 + unknown age'));
+});
+</script>
+</body>
+</html>
